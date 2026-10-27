@@ -10,7 +10,7 @@
 #define POTENCIA_DBM       14       // igual que el modelo del canal virtual
 #define FREC_MHZ           903.9f   // DEBE ser uno de los 8 canales del gateway (US915 sub-banda 2: 903.9 ... 905.3)
 #define SYNC_PUBLICO       0x34     // sync word LoRaWAN: el gateway solo demodula esta
-#define NODO_ID            1
+#define NODO_ID         // Colocar su numero de lista para definir el nodo
 #define N_PAQUETES         20       // paquetes por ronda
 #define PERIODO_SF7_MS     2000     // periodo entre paquetes en SF7
 #define PERIODO_SF12_MS    3000     // periodo entre paquetes en SF12 (ToA ~1 s)
