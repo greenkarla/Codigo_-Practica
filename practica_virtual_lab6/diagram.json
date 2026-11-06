@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "author": "Laboratorio 6",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht", "top": -110, "left": 200, "attrs": { "temperature": "24.7", "humidity": "61.3" } },
+    { "type": "chip-sx1262", "id": "chip1", "top": 97, "left": 420, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:3V3", "dht:VCC", "red", [] ],
+    [ "esp:GND.1", "dht:GND", "black", [] ],
+    [ "esp:4", "dht:SDA", "green", [] ],
+    [ "esp:3V3", "chip1:VCC", "red", [] ],
+    [ "esp:GND.2", "chip1:GND", "black", [] ],
+    [ "esp:18", "chip1:SCK", "blue", [] ],
+    [ "esp:19", "chip1:MISO", "purple", [] ],
+    [ "esp:23", "chip1:MOSI", "orange", [] ],
+    [ "esp:5", "chip1:NSS", "green", [] ],
+    [ "esp:34", "chip1:DIO1", "yellow", [] ],
+    [ "esp:27", "chip1:RESET", "blue", [] ],
+    [ "esp:33", "chip1:BUSY", "yellow", [] ]
+  ],
+  "dependencies": {}
+}
