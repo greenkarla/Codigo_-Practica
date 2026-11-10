@@ -53,6 +53,7 @@ def main():
     ap.add_argument('--n', type=int, default=20, help='paquetes por ronda (igual que N_PAQUETES del sketch)')
     ap.add_argument('--nodo', type=int, default=1, help='NODO_ID de tu sketch')
     ap.add_argument('--json-len', type=int, default=36, help='bytes del JSON equivalente')
+    ap.add_argument('--freq', type=float, default=0, help='MHz: solo cuenta las tramas de este canal (ej. 903.9); 0 = todos')
     ap.add_argument('--espera', type=float, default=0, help='segundos maximos tras el primer paquete (0 = automatico)')
     a = ap.parse_args()
 
@@ -68,6 +69,7 @@ def main():
     primero = {}                            # sf -> instante del primer paquete valido
     ajenos = 0                              # tramas que no son nuestras (otros dispositivos LoRaWAN, ruido, CRC malo)
     otro_sf = 0
+    otro_canal = 0                          # copias en otra frecuencia (imagenes/espurias del gateway)
     t_ini = None
 
     def ronda_completa(sf):
@@ -99,21 +101,23 @@ def main():
                 d = desempaquetar(frame)
                 if not d or d[0] != a.nodo:
                     ajenos += 1; continue
+                if a.freq and abs(float(r.get('freq', 0)) - a.freq) > 0.05:
+                    otro_canal += 1; continue
                 sf = next((x for x in sfs if r.get('datr') == f'SF{x}BW125'), None)
                 if sf is None:
                     otro_sf += 1; continue
                 if t_ini is None:
                     t_ini = time.time()
                 primero.setdefault(sf, time.time())
-                if d[1] not in vistos[sf]:
+                if d[1] not in vistos[sf] or float(r['rssi']) > vistos[sf][d[1]][0]:   # se queda con la copia mas fuerte
                     vistos[sf][d[1]] = (float(r['rssi']), float(r['lsnr']))
                 print(f"[RX] SF{sf} seq={d[1]:>3} T={d[2]:.2f}C H={d[3]:.1f}% RSSI={r['rssi']} dBm SNR={r['lsnr']} dB {r.get('freq')} MHz")
     except KeyboardInterrupt:
         print('\nInterrumpido: se usan los paquetes recibidos hasta ahora.')
 
-    print(f'\nTramas ajenas ignoradas: {ajenos} | con SF no esperado: {otro_sf}')
-    print('| Punto | Distancia (m) | SF | Binario (B) | JSON (B) | ToA binario (ms) | ToA JSON (ms) | RSSI (dBm) | SNR (dB) | PDR (%) |')
-    print('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+    print(f'\nTramas ajenas ignoradas: {ajenos} | con SF no esperado: {otro_sf} | en otro canal: {otro_canal}')
+    filas = []
+    resumen = []
     for sf in sfs:
         v = vistos[sf]
         rec = len(v)
@@ -121,9 +125,25 @@ def main():
         snr = sum(x[1] for x in v.values()) / rec if rec else float('nan')
         r_txt = f'{rssi:.1f}' if rec else '—'
         s_txt = f'{snr:.1f}' if rec else '—'
-        print(f'| {a.punto} | {a.dist:.0f} | {sf} | 8 | {a.json_len} | {toa_ms(8, sf):.1f} | {toa_ms(a.json_len, sf):.1f} | '
-              f'{r_txt} | {s_txt} | {100.0 * rec / a.n:.1f} |')
-        print(f'  (SF{sf}: recibidos {rec}/{a.n})', file=sys.stderr)
+        filas.append([a.punto, f'{a.dist:.0f}', sf, 8, a.json_len, f'{toa_ms(8, sf):.1f}', f'{toa_ms(a.json_len, sf):.1f}',
+                      r_txt, s_txt, f'{100.0 * rec / a.n:.1f}'])
+        resumen.append(f'SF{sf}: {rec}/{a.n}')
+    imprimir_tabla(filas)
+    print('Recibidos: ' + ' | '.join(resumen))
+
+def imprimir_tabla(filas):
+    """Tabla Markdown con las columnas alineadas (cada columna con el mismo ancho en todas las filas)."""
+    enc = ['Punto', 'Distancia (m)', 'SF', 'Binario (B)', 'JSON (B)', 'ToA binario (ms)', 'ToA JSON (ms)',
+           'RSSI (dBm)', 'SNR (dB)', 'PDR (%)']
+    anchos = [max(len(str(x)) for x in col) for col in zip(enc, *filas)]
+    def linea(celdas):
+        return '| ' + ' | '.join(str(c).rjust(w) for c, w in zip(celdas, anchos)) + ' |'
+    print(linea(enc))
+    print('| ' + ' | '.join('-' * w for w in anchos) + ' |')
+    for f in filas:
+        print(linea(f))
 
 if __name__ == '__main__':
     main()
+
+
