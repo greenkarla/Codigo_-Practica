@@ -28,6 +28,5 @@ CREATE TABLE lecturas (
     CONSTRAINT chk_lecturas_humedad     CHECK (humedad BETWEEN 0 AND 100)
 );
 
--- Acelera la busqueda de la ultima lectura por dispositivo
 CREATE INDEX idx_lecturas_dispositivo_fecha
     ON lecturas (dispositivo_id, fecha_registro DESC);
