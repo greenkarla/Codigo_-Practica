@@ -1,0 +1,33 @@
+-- Permite repetir el script desde cero sin errores
+DROP TABLE IF EXISTS lecturas;
+DROP TABLE IF EXISTS dispositivos;
+
+-- Catalogo de dispositivos
+CREATE TABLE dispositivos (
+    id_dispositivo VARCHAR(20)  PRIMARY KEY,
+    nombre         VARCHAR(60)  NOT NULL,
+    ubicacion      VARCHAR(100) NOT NULL,
+    tipo_sensor    VARCHAR(30)  NOT NULL,
+    estado         VARCHAR(10)  NOT NULL DEFAULT 'activo',
+    CONSTRAINT chk_dispositivos_estado CHECK (estado IN ('activo', 'inactivo'))
+);
+
+-- Lecturas de telemetria: muchas por cada dispositivo
+CREATE TABLE lecturas (
+    id_lectura     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dispositivo_id VARCHAR(20)  NOT NULL,
+    temperatura    NUMERIC(5,2) NOT NULL,
+    humedad        NUMERIC(5,2) NOT NULL,
+    fecha_registro TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_lecturas_dispositivo
+        FOREIGN KEY (dispositivo_id)
+        REFERENCES dispositivos (id_dispositivo)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT,
+    CONSTRAINT chk_lecturas_temperatura CHECK (temperatura BETWEEN -40 AND 80),
+    CONSTRAINT chk_lecturas_humedad     CHECK (humedad BETWEEN 0 AND 100)
+);
+
+-- Acelera la busqueda de la ultima lectura por dispositivo
+CREATE INDEX idx_lecturas_dispositivo_fecha
+    ON lecturas (dispositivo_id, fecha_registro DESC);

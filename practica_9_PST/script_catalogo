@@ -1,0 +1,8 @@
+INSERT INTO dispositivos (id_dispositivo, nombre, ubicacion, tipo_sensor, estado) VALUES
+    ('ESP32_LORA_01', 'Nodo sensor LoRa del equipo', 'Laboratorio de Telematica - Mesa 1', 'DHT22',    'activo'),
+    ('ESP32_SIM_01',  'Nodo simulado por MQTT',      'Servidor central',                   'Simulado', 'activo'),
+    ('ESP32_LORA_99', 'Nodo de respaldo',            'Bodega del laboratorio',             'DHT22',    'inactivo');
+
+SELECT id_dispositivo, nombre, ubicacion, tipo_sensor, estado
+FROM dispositivos
+ORDER BY id_dispositivo;
