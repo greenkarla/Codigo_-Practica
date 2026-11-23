@@ -1,0 +1,141 @@
+#!/bin/bash
+# Crea y despliega el flujo de Node-RED de un grupo:
+#   mqtt in -> json -> function (validar y filtrar) -> postgresql -> debug
+# Uso:  bash crear_flujo_grupo.sh NN C
+#   NN = numero de grupo (01 a 06)      C = numero de celda (1 a 3)
+set -e
+
+GRUPO="$1"
+CELDA="$2"
+if [[ ! "$GRUPO" =~ ^0[1-6]$ ]] || [[ ! "$CELDA" =~ ^[1-3]$ ]]; then
+  echo "Uso: bash crear_flujo_grupo.sh NN C   (NN = grupo 01 a 06, C = celda 1 a 3)"
+  exit 1
+fi
+
+PUERTO="18$GRUPO"
+BD="iot_telematica_eq$GRUPO"
+ID_REAL=$(printf "ESP32_LORA_%02d" "$CELDA")
+ID_SIM="ESP32_SIM_$GRUPO"
+TMP=$(mktemp)
+
+echo "=== Flujo del grupo $GRUPO (celda $CELDA) ==="
+echo "Node-RED : puerto $PUERTO"
+echo "Base     : $BD"
+echo "Acepta   : $ID_REAL (nodo real de la celda) y $ID_SIM (nodo simulado del grupo)"
+
+# ---------- 1. Generar el flujo con los valores del grupo ----------
+python3 - "$GRUPO" "$BD" "$ID_REAL" "$ID_SIM" > "$TMP" <<'PY'
+import json
+import sys
+
+grupo, bd, id_real, id_sim = sys.argv[1:5]
+
+funcion = """// Entrada:  msg.payload = objeto JS con id, temp, hum, seq, rssi, snr
+// Salida:   msg.params  = arreglo con los valores para $1, $2 y $3
+const d = msg.payload;
+
+// 1. El mensaje debe ser un objeto JSON
+if (typeof d !== "object" || d === null || Array.isArray(d)) {
+    node.warn("El payload no es un objeto JSON; mensaje descartado");
+    return null;
+}
+
+// 2. El identificador debe ser texto y caber en VARCHAR(20)
+const id = (typeof d.id === "string") ? d.id.trim() : "";
+
+if (id === "" || id.length > 20) {
+    node.warn("Campo id ausente o demasiado largo; mensaje descartado");
+    return null;
+}
+
+// 3. Solo se procesan los dispositivos de este grupo:
+//    el nodo real de la celda y el nodo simulado del grupo
+const PERMITIDOS = ["ID_REAL", "ID_SIM"];
+if (!PERMITIDOS.includes(id)) {
+    return null;
+}
+
+// 4. Temperatura y humedad deben ser numeros reales
+if (typeof d.temp !== "number" || typeof d.hum !== "number" ||
+    !Number.isFinite(d.temp) || !Number.isFinite(d.hum)) {
+    node.warn("temp o hum no son numericos: " + JSON.stringify(d));
+    return null;
+}
+
+// 5. Los valores viajan separados del texto SQL, en el mismo orden que $1, $2, $3
+msg.params = [id, d.temp.toFixed(2), d.hum.toFixed(2)];
+return msg;""".replace("ID_REAL", id_real).replace("ID_SIM", id_sim)
+
+consulta = ("INSERT INTO lecturas (dispositivo_id, temperatura, humedad)\n"
+            "VALUES ($1, $2::numeric, $3::numeric)\n"
+            "RETURNING id_lectura, dispositivo_id, temperatura, humedad, fecha_registro;")
+
+tab = "pst_tab_" + grupo
+
+flujo = [
+    {"id": tab, "type": "tab", "label": "PST Grupo " + grupo, "disabled": False, "info": ""},
+    {"id": "pst_broker", "type": "mqtt-broker", "name": "Mosquitto local",
+     "broker": "localhost", "port": "1883", "clientid": "", "autoConnect": True,
+     "usetls": False, "protocolVersion": "4", "keepalive": "60", "cleansession": True,
+     "autoUnsubscribe": True, "birthTopic": "", "birthQos": "0", "birthPayload": "",
+     "birthMsg": {}, "closeTopic": "", "closeQos": "0", "closePayload": "", "closeMsg": {},
+     "willTopic": "", "willQos": "0", "willPayload": "", "willMsg": {}, "userProps": "",
+     "sessionExpiry": "",
+     "credentials": {"user": "pst_iot", "password": "Pst2026_mqtt"}},
+    {"id": "pst_pgcfg", "type": "postgreSQLConfig", "name": "PG " + bd,
+     "host": "localhost", "hostFieldType": "str", "port": 5432, "portFieldType": "num",
+     "database": bd, "databaseFieldType": "str", "ssl": False, "sslFieldType": "bool",
+     "applicationName": "", "applicationNameType": "str", "max": 10, "maxFieldType": "num",
+     "idle": 1000, "idleFieldType": "num", "connectionTimeout": 10000,
+     "connectionTimeoutFieldType": "num", "userFieldType": "cred", "userEnv": "",
+     "passwordFieldType": "cred", "passwordEnv": "",
+     "credentials": {"user": "estudiante_iot", "password": "Pst2026_iot"}},
+    {"id": "pst_mqttin", "type": "mqtt in", "z": tab, "name": "Telemetria LoRa",
+     "topic": "sensores/lora/telemetria", "qos": "0", "datatype": "utf8",
+     "broker": "pst_broker", "nl": False, "rap": True, "rh": 0, "inputs": 0,
+     "x": 130, "y": 100, "wires": [["pst_json"]]},
+    {"id": "pst_json", "type": "json", "z": tab, "name": "", "property": "payload",
+     "action": "obj", "pretty": False, "x": 310, "y": 100,
+     "wires": [["pst_func", "pst_dbg_obj"]]},
+    {"id": "pst_func", "type": "function", "z": tab, "name": "Validar y mapear",
+     "func": funcion, "outputs": 1, "timeout": 0, "noerr": 0, "initialize": "",
+     "finalize": "", "libs": [], "x": 510, "y": 100, "wires": [["pst_pg"]]},
+    {"id": "pst_pg", "type": "postgresql", "z": tab, "name": "Insertar lectura",
+     "query": consulta, "postgreSQLConfig": "pst_pgcfg", "split": False,
+     "rowsPerMsg": 1, "outputs": 1, "x": 710, "y": 100, "wires": [["pst_dbg_fila"]]},
+    {"id": "pst_dbg_obj", "type": "debug", "z": tab, "name": "Objeto recibido",
+     "active": True, "tosidebar": True, "console": False, "tostatus": False,
+     "complete": "payload", "targetType": "msg", "statusVal": "", "statusType": "auto",
+     "x": 520, "y": 160, "wires": []},
+    {"id": "pst_dbg_fila", "type": "debug", "z": tab, "name": "Fila insertada",
+     "active": True, "tosidebar": True, "console": False, "tostatus": False,
+     "complete": "payload", "targetType": "msg", "statusVal": "", "statusType": "auto",
+     "x": 910, "y": 100, "wires": []},
+    {"id": "pst_catch", "type": "catch", "z": tab, "name": "", "scope": None,
+     "uncaught": False, "x": 120, "y": 240, "wires": [["pst_dbg_err"]]},
+    {"id": "pst_dbg_err", "type": "debug", "z": tab, "name": "Errores",
+     "active": True, "tosidebar": True, "console": False, "tostatus": False,
+     "complete": "true", "targetType": "full", "statusVal": "", "statusType": "auto",
+     "x": 300, "y": 240, "wires": []},
+]
+
+print(json.dumps(flujo, ensure_ascii=False))
+PY
+
+# ---------- 2. Desplegar en el Node-RED del grupo ----------
+RESPUESTA=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:$PUERTO/flows" \
+  -H "Content-Type: application/json" \
+  -H "Node-RED-Deployment-Type: full" \
+  --data @"$TMP")
+rm -f "$TMP"
+
+if [ "$RESPUESTA" != "200" ] && [ "$RESPUESTA" != "204" ]; then
+  echo "[Error] Node-RED respondio con el codigo $RESPUESTA."
+  echo "Revise que el Paso 4 haya terminado:  systemctl is-active nodered-eq@$GRUPO"
+  exit 1
+fi
+
+IP=$(hostname -I | awk '{print $1}')
+echo ""
+echo "=== FLUJO DESPLEGADO ==="
+echo "Abra http://$IP:$PUERTO  y revise la pestana 'PST Grupo $GRUPO'"
