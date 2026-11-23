@@ -1,0 +1,88 @@
+#!/bin/bash
+# Crea el espacio propio de un grupo en la Raspberry:
+#   - su base de datos  iot_telematica_eqNN
+#   - su Node-RED en el puerto 18NN, con el nodo de PostgreSQL
+# Uso:  bash crear_espacio_grupo.sh NN      (NN = numero de grupo, de 01 a 06)
+set -e
+
+GRUPO="$1"
+if [[ ! "$GRUPO" =~ ^0[1-6]$ ]]; then
+  echo "Uso: bash crear_espacio_grupo.sh NN   (NN = numero de grupo, de 01 a 06)"
+  exit 1
+fi
+
+BD="iot_telematica_eq$GRUPO"
+PUERTO="18$GRUPO"
+echo "=== Grupo $GRUPO: base $BD y Node-RED en el puerto $PUERTO ==="
+
+# ---------- 1. Base de datos propia del grupo ----------
+cd /tmp
+if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '$BD';" | grep -q 1; then
+  echo "[BD] La base $BD ya existe; se conserva"
+else
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE $BD OWNER estudiante_iot;"
+fi
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "REVOKE ALL ON DATABASE $BD FROM PUBLIC;"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE $BD TO estudiante_iot;"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER DATABASE $BD SET timezone TO 'America/Guayaquil';"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$BD" -c "GRANT ALL ON SCHEMA public TO estudiante_iot;"
+echo "[BD] Base $BD lista"
+
+# ---------- 2. Plantilla de servicio para las instancias de Node-RED ----------
+NR_BIN=$(command -v node-red || true)
+if [ -z "$NR_BIN" ]; then
+  echo "[Node-RED] No esta instalado. Primero el Grupo A debe terminar el Paso 2A"
+  exit 1
+fi
+
+USUARIO=$(whoami)
+if [ ! -f /etc/systemd/system/nodered-eq@.service ]; then
+  sudo tee /etc/systemd/system/nodered-eq@.service > /dev/null <<SERVICIO
+[Unit]
+Description=Node-RED del grupo %i
+After=network-online.target postgresql.service mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USUARIO
+Environment="NODE_OPTIONS=--max-old-space-size=256"
+ExecStart=$NR_BIN -p 18%i -u $HOME/nodered-eq%i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICIO
+  sudo systemctl daemon-reload
+  echo "[Node-RED] Plantilla de servicio creada"
+fi
+
+# ---------- 3. Instancia propia de Node-RED con el nodo de PostgreSQL ----------
+mkdir -p "$HOME/nodered-eq$GRUPO"
+echo "[Node-RED] Instalando node-red-contrib-postgresql (puede tardar 1 o 2 minutos)..."
+npm install --prefix "$HOME/nodered-eq$GRUPO" --no-audit --no-fund node-red-contrib-postgresql > /dev/null
+sudo systemctl enable --now "nodered-eq@$GRUPO"
+
+# ---------- 4. Verificacion ----------
+echo "[Node-RED] Esperando a que arranque en el puerto $PUERTO..."
+LISTO=0
+for i in $(seq 1 60); do
+  if curl -sf -o /dev/null "http://localhost:$PUERTO"; then
+    LISTO=1
+    break
+  fi
+  sleep 2
+done
+
+IP=$(hostname -I | awk '{print $1}')
+if [ "$LISTO" = "1" ]; then
+  echo ""
+  echo "=== LISTO ==="
+  echo "Base de datos : $BD"
+  echo "Node-RED      : http://$IP:$PUERTO"
+else
+  echo "[Node-RED] No respondio en el puerto $PUERTO."
+  echo "Revise con:  sudo journalctl -u nodered-eq@$GRUPO -n 30 --no-pager"
+  exit 1
+fi
