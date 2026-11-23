@@ -1,0 +1,136 @@
+/*
+ * PST - Practica Node-RED + PostgreSQL
+ * NODO 1: Transmisor LoRa con sensor DHT22
+ */
+#include <SPI.h>
+#include <RadioLib.h>
+#include <DHT.h>
+
+// ---------- Unico valor que cambia por equipo (1 a 8) ----------
+#define EQUIPO # //agregar el numero de grupo asignado.
+
+// ---------- Pines internos del SX1262 en la Heltec V3 (fijos en la placa) ----------
+#define LORA_NSS    8
+#define LORA_SCK    9
+#define LORA_MOSI  10
+#define LORA_MISO  11
+#define LORA_RST   12
+#define LORA_BUSY  13
+#define LORA_DIO1  14
+
+// ---------- LED blanco de la placa ----------
+#define LED_PIN    35
+
+// ---------- Sensor DHT22 ----------
+#define DHT_PIN    7
+#define DHT_TYPE   DHT22
+
+// ---------- Parametros de radio (identicos en el gateway) ----------
+const uint32_t LORA_FRECUENCIA_HZ = 915000000UL + (EQUIPO - 1) * 600000UL;
+const uint32_t LORA_BW_HZ         = 125000UL;  // Ancho de banda 125 kHz
+const uint8_t  LORA_SF            = 7;         // Spreading Factor
+const uint8_t  LORA_CR            = 5;         // Coding Rate 4/5
+const uint8_t  LORA_SYNC          = 0x12;      // Sync word de red privada
+const int8_t   LORA_POTENCIA      = 14;        // dBm
+const uint16_t LORA_PREAMBULO     = 8;         // simbolos
+
+// ---------- Periodo de muestreo ----------
+const unsigned long INTERVALO_MS = 10000UL;
+
+// El SX1262 usa el bus SPI con los pines de la Heltec V3
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+char deviceId[20];
+unsigned long ultimoEnvio = 0;
+unsigned long secuencia = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Identificador unico del nodo: ESP32_LORA_01, ESP32_LORA_02, ...
+  snprintf(deviceId, sizeof(deviceId), "ESP32_LORA_%02d", EQUIPO);
+  Serial.println();
+  Serial.print("[INICIO] Nodo transmisor ");
+  Serial.println(deviceId);
+
+  dht.begin();
+
+  // Bus SPI con los pines del SX1262
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  // La Heltec V3 tiene un oscilador TCXO alimentado a 1,8 V
+  radio.tcxoVoltage = RadioLibTCXOVoltage_t::Voltage1V8;
+
+  ConfigLoRa_t config;
+  config.frequency       = LORA_FRECUENCIA_HZ;
+  config.bandwidth       = LORA_BW_HZ;
+  config.spreadingFactor = LORA_SF;
+  config.codingRate      = LORA_CR;
+  config.syncWord        = LORA_SYNC;
+  config.power           = LORA_POTENCIA;
+  config.preambleLength  = LORA_PREAMBULO;
+
+  int16_t estado = radio.begin(config);
+  while (estado != RADIOLIB_ERR_NONE) {
+    Serial.print("[LoRa] Error al iniciar el SX1262, codigo ");
+    Serial.print(estado);
+    Serial.println(". Reintento en 2 s");
+    delay(2000);
+    estado = radio.begin(config);
+  }
+
+  Serial.print("[LoRa] Listo en ");
+  Serial.print(LORA_FRECUENCIA_HZ / 1000000.0, 1);
+  Serial.println(" MHz, SF7, BW 125 kHz, CR 4/5");
+
+  // Fuerza la primera transmision 2,5 s despues del arranque
+  // (el DHT22 necesita al menos 2 s para estabilizarse)
+  ultimoEnvio = millis() - INTERVALO_MS + 2500UL;
+}
+
+void loop() {
+  // Temporizacion sin bloqueo
+  if (millis() - ultimoEnvio < INTERVALO_MS) {
+    return;
+  }
+  ultimoEnvio = millis();
+
+  float humedad = dht.readHumidity();
+  float temperatura = dht.readTemperature();   // grados Celsius
+
+  // El DHT22 devuelve NaN si falla la lectura: no se transmite basura
+  if (isnan(humedad) || isnan(temperatura)) {
+    Serial.println("[DHT22] Lectura invalida. Revise DATA en GPIO 7 y la resistencia pull-up");
+    return;
+  }
+
+  secuencia++;
+
+  // Payload JSON: {"id":"ESP32_LORA_01","temp":27.40,"hum":68.20,"seq":1}
+  char payload[96];
+  int n = snprintf(payload, sizeof(payload),
+                   "{\"id\":\"%s\",\"temp\":%.2f,\"hum\":%.2f,\"seq\":%lu}",
+                   deviceId, temperatura, humedad, secuencia);
+
+  if (n < 0 || n >= (int)sizeof(payload)) {
+    Serial.println("[TX] Payload demasiado largo, no se transmite");
+    return;
+  }
+
+  digitalWrite(LED_PIN, HIGH);
+  int16_t estado = radio.transmit(payload);   // bloquea hasta terminar la transmision
+  digitalWrite(LED_PIN, LOW);
+
+  if (estado == RADIOLIB_ERR_NONE) {
+    Serial.print("[TX] ");
+    Serial.println(payload);
+  } else {
+    Serial.print("[TX] Error al transmitir, codigo ");
+    Serial.println(estado);
+  }
+}
