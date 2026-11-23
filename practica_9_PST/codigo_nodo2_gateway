@@ -1,0 +1,264 @@
+/*
+ * PST - Practica Node-RED + PostgreSQL
+ * NODO 2: Gateway LoRa -> Wi-Fi -> MQTT
+ * Placa: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262, 915 MHz)
+ * Librerias (Gestor de Librerias de Arduino IDE):
+ *   - "RadioLib" de Jan Gromes, version 8.x
+ *   - "PubSubClient" de Nick O'Leary
+ */
+#include <SPI.h>
+#include <RadioLib.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ---------- Unico valor que cambia por equipo (1 a 8) ----------
+#define EQUIPO # //Agregar el numero del grupo que esta asignado, debe ser igual al numero que se le dio al nodo transmisor
+
+// ---------- Red Wi-Fi (2,4 GHz, la misma red de la Raspberry) ----------
+const char* WIFI_SSID = "NOMBRE_DE_TU_RED";  // Agregar el nombre de la red del lab 
+const char* WIFI_PASS = "CLAVE_DE_TU_RED";
+
+// ---------- Broker Mosquitto en la Raspberry ----------
+const char* MQTT_HOST  = "192.168."; // Agregar la IP de la raspberry
+const int   MQTT_PORT  = 1883;
+const char* MQTT_USER  = "pst_iot";
+const char* MQTT_PASS  = "Pst2026_mqtt";
+const char* MQTT_TOPIC = "sensores/lora/telemetria";
+
+// ---------- Pines internos del SX1262 en la Heltec V3 (fijos en la placa) ----------
+#define LORA_NSS    8
+#define LORA_SCK    9
+#define LORA_MOSI  10
+#define LORA_MISO  11
+#define LORA_RST   12
+#define LORA_BUSY  13
+#define LORA_DIO1  14
+
+// ---------- LED blanco de la placa ----------
+#define LED_PIN    35
+
+// ---------- Parametros de radio (identicos en el transmisor) ----------
+const uint32_t LORA_FRECUENCIA_HZ = 915000000UL + (EQUIPO - 1) * 600000UL;
+const uint32_t LORA_BW_HZ         = 125000UL;
+const uint8_t  LORA_SF            = 7;
+const uint8_t  LORA_CR            = 5;
+const uint8_t  LORA_SYNC          = 0x12;
+const int8_t   LORA_POTENCIA      = 14;
+const uint16_t LORA_PREAMBULO     = 8;
+
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
+WiFiClient clienteWifi;
+PubSubClient mqtt(clienteWifi);
+
+char clientId[40];
+unsigned long ultimoIntentoMqtt = 0;
+bool primerIntentoMqtt = true;
+
+// La interrupcion del SX1262 (pin DIO1) solo levanta esta bandera;
+// el paquete se lee despues, dentro de loop()
+volatile bool paqueteRecibido = false;
+
+void IRAM_ATTR alRecibirPaquete(void) {
+  paqueteRecibido = true;
+}
+
+// Conecta o reconecta el Wi-Fi. Espera como maximo 15 s por intento.
+void asegurarWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.print("[WiFi] Conectando a ");
+  Serial.print(WIFI_SSID);
+
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 15000UL) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] Conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Sin conexion. Se reintentara");
+  }
+}
+
+// Conecta o reconecta al broker. Un intento cada 5 s, sin bloquear el lazo.
+void asegurarMQTT() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) {
+    return;
+  }
+  if (!primerIntentoMqtt && millis() - ultimoIntentoMqtt < 5000UL) {
+    return;
+  }
+  primerIntentoMqtt = false;
+  ultimoIntentoMqtt = millis();
+
+  Serial.print("[MQTT] Conectando a ");
+  Serial.print(MQTT_HOST);
+  Serial.print(":");
+  Serial.print(MQTT_PORT);
+  Serial.print(" ... ");
+
+  if (mqtt.connect(clientId, MQTT_USER, MQTT_PASS)) {
+    Serial.println("conectado");
+  } else {
+    // Codigos utiles: -2 broker inalcanzable, 4 credenciales malas, 5 no autorizado
+    Serial.print("fallo, estado = ");
+    Serial.println(mqtt.state());
+  }
+}
+
+// Si llego un paquete LoRa, lo lee, lo valida, le agrega RSSI y SNR y lo publica.
+void atenderLoRa() {
+  if (!paqueteRecibido) {
+    return;
+  }
+  paqueteRecibido = false;
+
+  char trama[200];
+  size_t largo = radio.getPacketLength();
+
+  if (largo == 0 || largo >= sizeof(trama)) {
+    Serial.print("[RX] Paquete con largo invalido: ");
+    Serial.println((int)largo);
+    radio.startReceive();
+    return;
+  }
+
+  int16_t estado = radio.readData((uint8_t*)trama, largo);
+  int rssi = (int)radio.getRSSI();
+  float snr = radio.getSNR();
+
+  // Vuelve a escuchar de inmediato para no perder la siguiente trama
+  radio.startReceive();
+
+  if (estado == RADIOLIB_ERR_CRC_MISMATCH) {
+    Serial.println("[RX] Paquete danado (CRC incorrecto), descartado");
+    return;
+  }
+  if (estado != RADIOLIB_ERR_NONE) {
+    Serial.print("[RX] Error al leer el paquete, codigo ");
+    Serial.println(estado);
+    return;
+  }
+
+  trama[largo] = '\0';
+  int i = (int)largo;
+
+  // Validacion minima: debe ser un objeto JSON completo
+  if (i < 2 || trama[0] != '{' || trama[i - 1] != '}') {
+    Serial.print("[RX] Trama descartada (no es JSON): ");
+    Serial.println(trama);
+    return;
+  }
+
+  Serial.print("[RX] ");
+  Serial.print(trama);
+  Serial.print(" | RSSI ");
+  Serial.print(rssi);
+  Serial.print(" dBm | SNR ");
+  Serial.print(snr, 1);
+  Serial.println(" dB");
+
+  // Quita la llave de cierre y agrega los campos de radio
+  trama[i - 1] = '\0';
+  char mensaje[260];
+  int n = snprintf(mensaje, sizeof(mensaje), "%s,\"rssi\":%d,\"snr\":%.1f}", trama, rssi, snr);
+  if (n < 0 || n >= (int)sizeof(mensaje)) {
+    Serial.println("[MQTT] Mensaje demasiado largo, no se publica");
+    return;
+  }
+
+  if (!mqtt.connected()) {
+    Serial.println("[MQTT] Sin conexion al broker, lectura no publicada");
+    return;
+  }
+
+  digitalWrite(LED_PIN, HIGH);
+  bool ok = mqtt.publish(MQTT_TOPIC, mensaje);
+  digitalWrite(LED_PIN, LOW);
+
+  if (ok) {
+    Serial.print("[MQTT] Publicado en ");
+    Serial.println(MQTT_TOPIC);
+  } else {
+    Serial.println("[MQTT] Error al publicar");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Client ID unico: equipo + 3 bytes de la MAC, para que dos gateways no se expulsen
+  unsigned int sufijo = (unsigned int)(ESP.getEfuseMac() & 0xFFFFFFULL);
+  snprintf(clientId, sizeof(clientId), "gw-lora-eq%02d-%06X", EQUIPO, sufijo);
+
+  Serial.println();
+  Serial.print("[INICIO] Gateway LoRa-MQTT, cliente ");
+  Serial.println(clientId);
+
+  // Bus SPI con los pines del SX1262
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+  // La Heltec V3 tiene un oscilador TCXO alimentado a 1,8 V
+  radio.tcxoVoltage = RadioLibTCXOVoltage_t::Voltage1V8;
+
+  ConfigLoRa_t config;
+  config.frequency       = LORA_FRECUENCIA_HZ;
+  config.bandwidth       = LORA_BW_HZ;
+  config.spreadingFactor = LORA_SF;
+  config.codingRate      = LORA_CR;
+  config.syncWord        = LORA_SYNC;
+  config.power           = LORA_POTENCIA;
+  config.preambleLength  = LORA_PREAMBULO;
+
+  int16_t estado = radio.begin(config);
+  while (estado != RADIOLIB_ERR_NONE) {
+    Serial.print("[LoRa] Error al iniciar el SX1262, codigo ");
+    Serial.print(estado);
+    Serial.println(". Reintento en 2 s");
+    delay(2000);
+    estado = radio.begin(config);
+  }
+
+  // Cada paquete recibido dispara alRecibirPaquete()
+  radio.setIrqAction(alRecibirPaquete);
+
+  estado = radio.startReceive();
+  if (estado != RADIOLIB_ERR_NONE) {
+    Serial.print("[LoRa] Error al iniciar la recepcion, codigo ");
+    Serial.println(estado);
+  }
+
+  Serial.print("[LoRa] Escuchando en ");
+  Serial.print(LORA_FRECUENCIA_HZ / 1000000.0, 1);
+  Serial.println(" MHz");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(30);
+
+  asegurarWiFi();
+  asegurarMQTT();
+}
+
+void loop() {
+  asegurarWiFi();    // reconexion Wi-Fi
+  asegurarMQTT();    // reconexion MQTT
+  mqtt.loop();       // mantiene viva la sesion (keep-alive)
+  atenderLoRa();     // recepcion LoRa y publicacion
+}
